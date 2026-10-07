@@ -3122,7 +3122,12 @@ class Scheduler {
             chunk.requestCount = (chunk.requestCount || 0) + 1
             this.mark(job)
 
-            if (re.kind === 'timeout' || /timed out|timeout/i.test(re.message)) {
+            const isTimeoutAttempt =
+              re.kind === 'timeout' ||
+              /timed out|timeout|headers timeout/i.test(re.message) ||
+              (reqErr instanceof Error && /timed out|timeout|headers timeout/i.test(reqErr.message))
+
+            if (isTimeoutAttempt) {
               globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
               const timeoutSec = Math.round(CHUNK_MAP_TIMEOUT_MS / 1000)
               const errTokenUsageTimeout: ChunkTokenUsage = {
@@ -3146,16 +3151,25 @@ class Scheduler {
                 'error',
                 reqErr instanceof Error ? reqErr.message : String(reqErr),
               )
+              // USER INSTRUCTION: Count 360s timeout request towards quota usage (API key processed it)
+              const used = incrementModelUsage(m.id, lane.apiKey)
+              st.usedToday = used
+              chunk.requestCount = (chunk.requestCount || 0) + 1
+              job.laneFirstSuccess.add(lane.idx)
+
+              // USER INSTRUCTION: Enforce mandatory 30-second cooldown on that model in Global Coordinator
+              const outcome = globalGeminiCoordinator.recordChunkSuccess(lane.apiKey, m.id, chunkLockId)
+              job.cooldownUntil[rk] = outcome.cooldownUntil
+              job.nextFreeAt[rk] = outcome.cooldownUntil
+              st.state = 'cooling'
+              st.cooldownUntil = outcome.cooldownUntil
+              this.mark(job)
+
               addLog(
                 scan,
                 'warn',
-                `${minutePrefix}Chunk ${chunkIndex}: ${displayModelName(m.id)} (key ${lane.idx}) timed out after ${timeoutSec}s (est. input: ~${estimatedTokens.toLocaleString()} tokens) — aborting request and switching to next model!`,
+                `${minutePrefix}Chunk ${chunkIndex}: ${displayModelName(m.id)} (key ${lane.idx}) timed out after ${timeoutSec}s — request counted (${used}/${m.rpd || 20} RPD), 30s lock enforced! Switching to next model.`,
               )
-              // Put this model lane on 1-min cooldown so other models or keys pick up this chunk
-              job.cooldownUntil[rk] = Date.now() + 60_000
-              st.state = 'cooling'
-              st.cooldownUntil = Date.now() + 60_000
-              this.mark(job)
               throw reqErr
             } else if (re.kind === 'overloaded') {
               overloadedRetries++
@@ -3312,36 +3326,18 @@ class Scheduler {
               )
               throw reqErr
             } else if (re.kind === 'rpd') {
-              // Daily Quota: ONLY if model actually reached configured RPD limit (e.g. 20 RPD)
-              const used = getModelUsage(m.id, lane.apiKey)
-              if (used >= (m.rpd || 20)) {
-                globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
-                globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, m.rpd || 20)
-                setModelExhausted(m.id, lane.apiKey, m.rpd || 20)
-                st.state = 'exhausted'
-                this.mark(job)
-                addLog(
-                  scan,
-                  'warn',
-                  `${minutePrefix}Chunk ${chunkIndex}: Daily limit reached (${used}/${m.rpd || 20} RPD) on ${displayModelName(m.id)} (key ${lane.idx}) — model exhausted for today; chunk re-queued for another key!`,
-                )
-                throw reqErr
-              } else {
-                // If not yet reached 20 RPD, do NOT mark daily exhausted! Give 1-min cooldown and hand chunk to another model!
-                globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
-                const cooldownMs = 60_000
-                globalGeminiCoordinator.reportRateLimit(lane.apiKey, m.id, cooldownMs, 0)
-                job.cooldownUntil[rk] = Date.now() + cooldownMs
-                st.state = 'cooling'
-                st.cooldownUntil = Date.now() + cooldownMs
-                this.mark(job)
-                addLog(
-                  scan,
-                  'warn',
-                  `${minutePrefix}Chunk ${chunkIndex}: Rate limit on ${displayModelName(m.id)} (key ${lane.idx}, used ${used}/${m.rpd || 20} RPD) — giving 1 min cooldown; handing chunk to another model!`,
-                )
-                throw reqErr
-              }
+              // Daily Quota: Either model reached RPD limit or Google explicitly reported RPD exhausted
+              globalGeminiCoordinator.clearChunkRetryLock(lane.apiKey, m.id, chunkLockId)
+              globalGeminiCoordinator.reportExhausted(lane.apiKey, m.id, 0, m.rpd || 20, true)
+              setModelExhausted(m.id, lane.apiKey, m.rpd || 20, true)
+              st.state = 'exhausted'
+              this.mark(job)
+              addLog(
+                scan,
+                'warn',
+                `${minutePrefix}Chunk ${chunkIndex}: Daily limit reached (${getModelUsage(m.id, lane.apiKey)}/${m.rpd || 20} RPD) on ${displayModelName(m.id)} (key ${lane.idx}) — model exhausted for today; chunk re-queued for another key!`,
+              )
+              throw reqErr
             } else if (re.kind === 'rate') {
 
               rateRetries++
@@ -3470,28 +3466,32 @@ class Scheduler {
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err, { keyIdx: lane.idx, model: m.id, requestKind: 'chunk_map' })
 
-        // Always record error & diagnostic in chunk output so user can click 'AI output' and see what happened.
-        const outerErrTokens: ChunkTokenUsage = {
-          shortVideoTokens: Math.round(segDuration * currentEmaRate),
-          chunkVideoTokens: Math.round(movieChunkDuration * currentEmaRate),
-          promptTokens: Math.round(promptChars / 4),
-          outputTokens: 0,
-          totalTokens: Math.round(totalVideoDurationSec * currentEmaRate + promptChars / 4),
-          shortDurationSec: Number(segDuration.toFixed(1)),
-          chunkDurationSec: Number(movieChunkDuration.toFixed(1)),
-          ratePerSec: Math.round(currentEmaRate),
-          isGoogleVerified: false,
-          isError: true,
-          errorMessage: e.message.slice(0, 160),
+        const isTimeoutErr = e.kind === 'timeout' || /timed out|timeout|headers timeout/i.test(e.message)
+
+        // Record error & diagnostic in chunk output (except timeout which already recorded detailed [REQUEST TIMEOUT DIAGNOSTIC])
+        if (!isTimeoutErr) {
+          const outerErrTokens: ChunkTokenUsage = {
+            shortVideoTokens: Math.round(segDuration * currentEmaRate),
+            chunkVideoTokens: Math.round(movieChunkDuration * currentEmaRate),
+            promptTokens: Math.round(promptChars / 4),
+            outputTokens: 0,
+            totalTokens: Math.round(totalVideoDurationSec * currentEmaRate + promptChars / 4),
+            shortDurationSec: Number(segDuration.toFixed(1)),
+            chunkDurationSec: Number(movieChunkDuration.toFixed(1)),
+            ratePerSec: Math.round(currentEmaRate),
+            isGoogleVerified: false,
+            isError: true,
+            errorMessage: e.message.slice(0, 160),
+          }
+          this.recordChunkOutput(
+            chunk,
+            m.id,
+            `[ERROR / DIAGNOSTIC]\nModel: ${m.id} (Key ${lane.idx})\nError: ${e.message}\nTime: ${new Date().toISOString()}`,
+            outerErrTokens,
+            'error',
+            e.message,
+          )
         }
-        this.recordChunkOutput(
-          chunk,
-          m.id,
-          `[ERROR / DIAGNOSTIC]\nModel: ${m.id} (Key ${lane.idx})\nError: ${e.message}\nTime: ${new Date().toISOString()}`,
-          outerErrTokens,
-          'error',
-          e.message,
-        )
 
         // INFRASTRUCTURE / TRANSIENT ERROR CHECK:
         // Quota limits, rate limits, model exhaustions, empty responses, temporary 503s, and network/upload hiccups
@@ -3568,9 +3568,8 @@ class Scheduler {
             undefined,
             lane.idx,
           )
-          const used = getModelUsage(m.id, lane.apiKey)
-          if (quotaOutcome.action === 'exhausted' && used >= (m.rpd || 20)) {
-            setModelExhausted(m.id, lane.apiKey, m.rpd)
+          if (quotaOutcome.action === 'exhausted' || e.kind === 'rpd') {
+            setModelExhausted(m.id, lane.apiKey, m.rpd || 20, true)
             const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
             if (laneState) {
               const ms = laneState.models.find((item) => item.id === m.id)
@@ -3589,15 +3588,17 @@ class Scheduler {
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
-        } else if (e.kind === 'timeout' || /timed out|timeout/i.test(e.message)) {
+        } else if (isTimeoutErr) {
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
+          const coolMs = CHUNK_COOLDOWN_MS
+          job.cooldownUntil[this.rateKey(lane, m)] = Date.now() + coolMs
           const laneState = job.scan.keyLanes?.find((l) => l.idx === lane.idx)
           if (laneState) {
             const ms = laneState.models.find((item) => item.id === m.id)
             if (ms) ms.state = 'cooling'
           }
-          addLog(scan, 'warn', `${m.id} (key ${lane.idx}): Request timed out after 3 minutes without response — Chunk ${chunkIndex} re-queued for next model/lane.`)
+          addLog(scan, 'warn', `${m.id} (key ${lane.idx}): Request timed out after 360s (counted in quota, 30s lock enforced) — Chunk ${chunkIndex} re-queued for next model/lane.`)
         } else if (e.kind === 'empty') {
           chunk.status = 'pending'
           job.queue.push(chunkIndex)

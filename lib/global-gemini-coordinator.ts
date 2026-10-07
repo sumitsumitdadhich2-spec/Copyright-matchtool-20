@@ -153,13 +153,8 @@ class GlobalGeminiCoordinator {
    */
   public isModelExhausted(apiKey: string, modelId: string, rpdCap: number = 500): boolean {
     this.checkDayRollover()
-    const used = getModelUsage(modelId, apiKey)
     const lane = this.getOrCreateLane(apiKey, modelId, 0)
-    // FINAL DECISION: Setting quota is the sole authority for daily exhaustion!
-    if (used < rpdCap) {
-      lane.isExhausted = false
-      return false
-    }
+    if (lane.isExhausted) return true
     const exhaustedInStore = isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)
     lane.isExhausted = exhaustedInStore
     return exhaustedInStore
@@ -212,12 +207,9 @@ class GlobalGeminiCoordinator {
     this.checkDayRollover()
     const lane = this.getOrCreateLane(apiKey, modelId, slot)
     const now = Date.now()
-    const used = getModelUsage(modelId, apiKey)
 
-    // FINAL DECISION: Only setting quota determines daily exhaustion!
-    if (used < rpdCap) {
-      lane.isExhausted = false
-    } else if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
+    // Daily exhaustion check
+    if (lane.isExhausted || isModelDailyQuotaExhausted(modelId, apiKey, rpdCap)) {
       lane.isExhausted = true
       return {
         busy: true,
@@ -1076,14 +1068,15 @@ class GlobalGeminiCoordinator {
             ? 'rpd'
             : 'rate'
 
-    // 1. FINAL DECISION: Only if actual recorded usage has reached or exceeded the setting quota cap AND Google did not specify a short retry window is it truly exhausted!
-    // If Google specifically returns a short retryDelay (<= 5 min), Google's API Gateway is saying this window will refill and can be retried!
-    if (used >= rpdCap && (!cooldownMsOverride || cooldownMsOverride > 300_000)) {
-      this.reportExhausted(apiKey, modelId, slot, rpdCap)
+    // 1. Quota Exhaustion check: Either explicit RPD error from Google API, or setting quota cap reached
+    const isGoogleRpdError = errKind === 'rpd' || (cooldownMsOverride !== undefined && cooldownMsOverride > 3600_000)
+    if (isGoogleRpdError || (used >= rpdCap && (!cooldownMsOverride || cooldownMsOverride > 300_000))) {
+      this.reportExhausted(apiKey, modelId, slot, rpdCap, true)
+      setModelExhausted(modelId, apiKey, rpdCap, true)
       return {
         action: 'exhausted',
         waitSec: 0,
-        reason: `Daily setting quota limit reached (${used}/${rpdCap} RPD) on ${modelId} (Key ${lane.keyIdx || keyIdx || 1})`,
+        reason: `Daily quota limit exhausted (${Math.max(used, rpdCap)}/${rpdCap} RPD) on ${modelId} (Key ${lane.keyIdx || keyIdx || 1})`,
       }
     }
 
@@ -1106,9 +1099,9 @@ class GlobalGeminiCoordinator {
   }
 
   /** Report that a model's daily quota has been exhausted across the entire app */
-  public reportExhausted(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 20) {
+  public reportExhausted(apiKey: string, modelId: string, slot: number = 0, rpdCap: number = 20, forceGoogleExhausted: boolean = false) {
     const used = getModelUsage(modelId, apiKey)
-    if (used < rpdCap) {
+    if (!forceGoogleExhausted && used < rpdCap) {
       console.warn(`[Global Coordinator] Ignored reportExhausted for Key ${slot} (${modelId}) because recorded usage (${used}) has not reached setting quota (${rpdCap} RPD).`)
       return
     }

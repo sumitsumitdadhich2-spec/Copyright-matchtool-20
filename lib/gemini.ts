@@ -851,6 +851,27 @@ export function classifyError(
     return new GeminiError('unavailable', msg, undefined, { httpStatus, googleStatus, quotaId, quotaValue })
   }
 
+  // 3.5. Timeout / Headers Timeout / Request Timeout / Deadline Exceeded
+  const isTimeout =
+    httpStatus === 504 ||
+    lower.includes('headers timeout') ||
+    lower.includes('headerstimeouterror') ||
+    lower.includes('timed out') ||
+    lower.includes('timeout') ||
+    lower.includes('etimedout') ||
+    lower.includes('esockettimedout') ||
+    lower.includes('deadline_exceeded') ||
+    lower.includes('deadline exceeded')
+
+  if (isTimeout) {
+    return new GeminiError('timeout', msg, undefined, {
+      httpStatus: httpStatus || 504,
+      googleStatus: googleStatus || 'DEADLINE_EXCEEDED',
+      quotaId,
+      quotaValue,
+    })
+  }
+
   // 4. HTTP 503/500/502/504 or status UNAVAILABLE/INTERNAL or "high demand"/"overloaded"/"service unavailable" => 'overloaded' (NOT 'rate')
   const isOverloaded =
     httpStatus === 503 ||

@@ -177,19 +177,12 @@ export function getModelUsage(model: string, apiKey: string): number {
 export function isModelDailyQuotaExhausted(model: string, apiKey: string, rpdCap: number = 20): boolean {
   checkDailyReset()
   const usage = getModelUsage(model, apiKey)
-  // FINAL DECISION: Only setting quota determines daily exhaustion!
-  if (usage < rpdCap) {
-    // If usage is below setting quota, it is NEVER exhausted!
-    // Clean up any false/stale _exh flag in counters
-    const counters = getCachedCounters()
-    const exhK = exhaustedKey(model, apiKey)
-    if (counters[exhK] !== undefined) {
-      delete counters[exhK]
-      saveCounters(counters)
-    }
-    return false
+  const counters = getCachedCounters()
+  const exhK = exhaustedKey(model, apiKey)
+  if (counters[exhK] !== undefined) {
+    return true
   }
-  return true
+  return usage >= rpdCap
 }
 
 export function getModelExhausted(model: string, apiKey: string): boolean {
@@ -227,15 +220,18 @@ export function decrementModelUsage(model: string, apiKey: string): number {
   return (counters[key] as number) || 0
 }
 
-export function setModelExhausted(model: string, apiKey: string, rpdCap: number = 20) {
+export function setModelExhausted(model: string, apiKey: string, rpdCap: number = 20, forceGoogleExhausted: boolean = false) {
   checkDailyReset()
   const usage = getModelUsage(model, apiKey)
-  // FINAL DECISION: Only persist exhausted flag if setting quota is actually reached!
-  if (usage < rpdCap) {
+  if (!forceGoogleExhausted && usage < rpdCap) {
     return
   }
   const counters = getCachedCounters()
-  counters[exhaustedKey(model, apiKey)] = { at: Date.now() }
+  // When Google returns RPD exhaustion, sync the local usage counter up to rpdCap (e.g. 20)
+  if (usage < rpdCap) {
+    counters[counterKey(model, apiKey)] = rpdCap
+  }
+  counters[exhaustedKey(model, apiKey)] = { at: Date.now(), forced: forceGoogleExhausted }
   saveCounters(counters)
 }
 
