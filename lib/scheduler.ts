@@ -202,6 +202,35 @@ class Scheduler {
     return this.jobs.has(scanId)
   }
 
+  /**
+   * Partitions available chunk keys between concurrently running scans.
+   * If only 1 scan is active, it receives 100% of all chunk keys (Key 3 to Key 15).
+   * If 2 or more scans are running in parallel, keys are divided into disjoint partitions
+   * (e.g. Scan 1 gets Key 3, 5, 7, 9, 11, 13, 15 and Scan 2 gets Key 4, 6, 8, 10, 12, 14)
+   * so they never launch workers on the same keys or collide on the same Google accounts!
+   */
+  public getAllocatedKeysForScan<T extends { idx: number }>(
+    scanId: string,
+    allKeys: T[],
+  ): T[] {
+    if (!allKeys || allKeys.length <= 1) return allKeys
+
+    const runningJobs = Array.from(this.jobs.values())
+      .filter((j) => !j.stopping && j.scan.status === 'scanning')
+      .sort((a, b) => (a.scan.startedAt || 0) - (b.scan.startedAt || 0))
+
+    if (runningJobs.length <= 1) {
+      return allKeys
+    }
+
+    const scanIndex = runningJobs.findIndex((j) => j.scan.id === scanId)
+    const slotIndex = scanIndex >= 0 ? scanIndex : runningJobs.length - 1
+    const totalScans = Math.min(allKeys.length, runningJobs.length)
+
+    const allocated = allKeys.filter((_, i) => i % totalScans === slotIndex % totalScans)
+    return allocated.length > 0 ? allocated : allKeys
+  }
+
   /** Synthesize/repair scan.shortSegments. Migration shim: old scans (short was
    *  trimmed to 1 minute) become a single segment that ADOPTS the existing
    *  scan.chunks array by reference, so all prior chunk states are preserved. */
@@ -322,9 +351,19 @@ class Scheduler {
     // PRIORITY RESERVATION: Key 1 and Key 2 are strictly reserved for Window Finder, Backup Finder, and Missing Scene Finder!
     // Chunk scans (1-minute chunk scanning) must NEVER consume Key 1 or Key 2's daily model quotas if more than 2 keys exist.
     const allKeysWithIdx = apiKeys.map((k, i) => ({ key: k, idx: i + 1 }))
-    const activeChunkKeys = allKeysWithIdx.length > 2
+    const allChunkKeys = allKeysWithIdx.length > 2
       ? allKeysWithIdx.filter((x) => x.idx > 2)
       : allKeysWithIdx
+
+    // PARALLEL SCAN ISOLATION:
+    // If multiple scans run simultaneously, partition keys so each scan gets dedicated non-overlapping keys!
+    // E.g. with 2 scans: Scan 1 gets (Key 3, 5, 7, 9, 11, 13, 15) and Scan 2 gets (Key 4, 6, 8, 10, 12, 14).
+    const otherActiveJobs = Array.from(this.jobs.values()).filter(
+      (j) => !j.stopping && j.scan.id !== scanId && j.scan.status === 'scanning',
+    )
+    const activeChunkKeys = otherActiveJobs.length > 0
+      ? this.getAllocatedKeysForScan(scanId, allChunkKeys)
+      : allChunkKeys
 
     const lanes: KeyLane[] = activeChunkKeys.map(({ key: k, idx }) => ({
       idx,
@@ -369,12 +408,15 @@ class Scheduler {
     }
 
     const minuteNote = segments.length > 1 ? ` across ${segments.length} short minutes (scanned sequentially)` : ''
+    const keysSummary = lanes.map((l) => `Key ${l.idx}`).join(', ')
     addLog(
       scan,
       'info',
-      resume
-        ? `Resuming: ${pendingChunks} chunk(s) pending${minuteNote}`
-        : `Scan started: ${pendingChunks} chunk(s) queued${minuteNote} across ${CHUNK_MODEL_POOL.length} chunk models (${CHUNK_MODEL_POOL.map((m) => m.id).join(', ')}) × ${lanes.length} API key(s) — one prompt per chunk`,
+      otherActiveJobs.length > 0
+        ? `Parallel scan active: assigned ${lanes.length} dedicated keys (${keysSummary}) to prevent collision with other scans`
+        : resume
+          ? `Resuming: ${pendingChunks} chunk(s) pending${minuteNote} across ${lanes.length} API key(s) (${keysSummary})`
+          : `Scan started: ${pendingChunks} chunk(s) queued${minuteNote} across ${CHUNK_MODEL_POOL.length} chunk models (${CHUNK_MODEL_POOL.map((m) => m.id).join(', ')}) × ${lanes.length} API key(s) (${keysSummary}) — one prompt per chunk`,
     )
 
     const job: Job = {
@@ -1200,10 +1242,16 @@ class Scheduler {
         this.prepareNextSegment(job, segments, seg.index)
 
         // CHUNK PIPELINE: Staggered model start per lane.
-        // For each lane, start ONLY the first model (pick primary rotated by keyIdx % modelCount),
-        // wait for that lane's first chunk to succeed, and only then launch the remaining models for that lane.
+        // Check if other parallel scans are active to filter only dedicated allocated lanes for this scan:
+        const currentOtherJobs = Array.from(this.jobs.values()).filter(
+          (j) => !j.stopping && j.scan.id !== job.scan.id && j.scan.status === 'scanning',
+        )
+        const effectiveLanes = currentOtherJobs.length > 0
+          ? this.getAllocatedKeysForScan(job.scan.id, job.lanes)
+          : job.lanes
+
         job.laneFirstSuccess.clear()
-        const lanePromises = job.lanes.map(async (lane) => {
+        const lanePromises = effectiveLanes.map(async (lane) => {
           const modelCount = CHUNK_MODEL_POOL.length
           if (modelCount === 0) return
           const primaryIdx = lane.idx % modelCount
@@ -2780,6 +2828,25 @@ class Scheduler {
         continue
       }
       st.cooldownUntil = null
+
+      // Parallel Scan partition check: if other scans are active, verify lane allocation:
+      const otherActiveJobs = Array.from(this.jobs.values()).filter(
+        (j) => !j.stopping && j.scan.id !== job.scan.id && j.scan.status === 'scanning',
+      )
+      if (otherActiveJobs.length > 0) {
+        const allocatedLanes = this.getAllocatedKeysForScan(job.scan.id, job.lanes)
+        const isAllocated = allocatedLanes.some((l) => l.idx === lane.idx)
+        if (!isAllocated) {
+          // This key belongs to the other running scan — do not pull chunks on this lane!
+          if (st.state !== 'idle' && st.state !== 'exhausted') {
+            st.state = 'idle'
+            st.currentChunk = null
+            this.mark(job)
+          }
+          await sleep(1500)
+          continue
+        }
+      }
 
       // Global Coordinator Availability check:
       // If this specific key/model lane is currently busy (working in another scan or in pacing delay),

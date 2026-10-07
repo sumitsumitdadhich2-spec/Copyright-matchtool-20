@@ -71,6 +71,8 @@ class GlobalGeminiCoordinator {
   private lanes = new Map<string, GlobalLaneState>()
   private verifyModelStates = new Map<string, VerifyModelState>()
   private chunkModelStates = new Map<string, ChunkModelState>()
+  private keyActiveScan = new Map<string, { scanId: string; scanTitle: string; operation: string; modelId: string }>()
+  private keyCooldownUntil = new Map<string, number>()
   private currentActiveDay = geminiUsageDay()
   private breakerEvents: BreakerFailureEvent[] = []
   private globalPauseUntil: number = 0
@@ -100,6 +102,8 @@ class GlobalGeminiCoordinator {
       }
       this.verifyModelStates.clear()
       this.chunkModelStates.clear()
+      this.keyActiveScan.clear()
+      this.keyCooldownUntil.clear()
       checkDailyReset()
       return true
     }
@@ -231,6 +235,26 @@ class GlobalGeminiCoordinator {
       }
     }
 
+    const kh = apiKeyHash(apiKey)
+    const activeKey = this.keyActiveScan.get(kh)
+    if (activeKey) {
+      return {
+        busy: true,
+        activeScanId: activeKey.scanId,
+        activeScanTitle: activeKey.scanTitle,
+        activeOperation: `Key busy with ${activeKey.modelId} (${activeKey.operation})`,
+      }
+    }
+
+    const keyCool = this.keyCooldownUntil.get(kh) || 0
+    if (keyCool > now) {
+      return {
+        busy: true,
+        cooling: true,
+        waitSec: Math.ceil((keyCool - now) / 1000),
+      }
+    }
+
     if (lane.cooldownUntil > now) {
       return {
         busy: true,
@@ -285,6 +309,8 @@ class GlobalGeminiCoordinator {
     }
     this.verifyModelStates.clear()
     this.chunkModelStates.clear()
+    this.keyActiveScan.clear()
+    this.keyCooldownUntil.clear()
     this.exhaustedLogSet.clear()
     try {
       cleanseStartupQuotas()
@@ -533,9 +559,12 @@ class GlobalGeminiCoordinator {
           return
         }
 
-        // Re-read lane's cooldown and global pause state before acquiring exclusively
+        // Re-read lane's cooldown, model cooldown and global pause state before acquiring exclusively
         const checkNow = Date.now()
-        if (lane.cooldownUntil > checkNow || lane.nextFreeAt > checkNow) {
+        const checkCmState = isChunk ? this.getChunkModelState(apiKey, modelId) : null
+        const checkVmState = isVerify ? this.getVerifyModelState(apiKey, modelId) : null
+        const checkModelCool = Math.max(checkCmState?.cooldownUntil || 0, checkVmState?.cooldownUntil || 0)
+        if (lane.cooldownUntil > checkNow || lane.nextFreeAt > checkNow || checkModelCool > checkNow) {
           void tryAcquireOrQueue()
           return
         }
@@ -711,10 +740,15 @@ class GlobalGeminiCoordinator {
       }
 
       const now = Date.now()
-      if (lane.cooldownUntil > now) {
+      const cmState = this.chunkModelStates.get(`${lane.keyHash}:${lane.modelId}`)
+      const vmState = this.verifyModelStates.get(`${lane.keyHash}:${lane.modelId}`)
+      const modelCool = Math.max(cmState?.cooldownUntil || 0, vmState?.cooldownUntil || 0)
+      const effectiveCool = Math.max(lane.cooldownUntil, modelCool)
+
+      if (effectiveCool > now) {
         // Still in cooldown, put back and wait
         lane.waiters.unshift(next)
-        const waitMs = lane.cooldownUntil - now
+        const waitMs = effectiveCool - now
         setTimeout(() => {
           void this.processNext(lane)
         }, waitMs + 50)
