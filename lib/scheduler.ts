@@ -3466,10 +3466,11 @@ class Scheduler {
       } catch (err) {
         const e = err instanceof GeminiError ? err : classifyError(err, { keyIdx: lane.idx, model: m.id, requestKind: 'chunk_map' })
 
-        const isTimeoutErr = e.kind === 'timeout' || /timed out|timeout|headers timeout/i.test(e.message)
+        const isFileProcessingError = /processing timed out|file upload failed|failed to initiate gemini resumable upload/i.test(e.message)
+        const isTimeoutErr = !isFileProcessingError && (e.kind === 'timeout' || /timed out|timeout|headers timeout/i.test(e.message))
 
-        // Record error & diagnostic in chunk output (except timeout which already recorded detailed [REQUEST TIMEOUT DIAGNOSTIC])
-        if (!isTimeoutErr) {
+        // Record error & diagnostic in chunk output (except model 360s timeout which already recorded detailed [REQUEST TIMEOUT DIAGNOSTIC])
+        if (!isTimeoutErr || isFileProcessingError) {
           const outerErrTokens: ChunkTokenUsage = {
             shortVideoTokens: Math.round(segDuration * currentEmaRate),
             chunkVideoTokens: Math.round(movieChunkDuration * currentEmaRate),
@@ -3497,23 +3498,41 @@ class Scheduler {
         // Quota limits, rate limits, model exhaustions, empty responses, temporary 503s, and network/upload hiccups
         // are properties of the API key/Gemini service — NEVER the chunk video itself!
         // These MUST NOT consume chunk.attempts, so transient bursts never mark a chunk as 'failed'!
+        if (isFileProcessingError) {
+          // Invalidate and delete local chunk file so the next attempt cuts a fresh clip
+          const chunksDir = path.join(scanMediaDir(scan.id), 'chunks')
+          const chunkFile = chunkPath(chunksDir, chunkIndex)
+          if (fs.existsSync(chunkFile)) {
+            try {
+              fs.unlinkSync(chunkFile)
+              console.log(`[Scheduler] Removed failed chunk file ${chunkFile} so next worker re-cuts fresh from source`)
+            } catch {}
+          }
+          for (const l of job.lanes) {
+            l.chunkUploads.delete(chunkIndex)
+          }
+          job.prefetchOwner.delete(chunkIndex)
+          chunk.attempts = (chunk.attempts || 0) + 1
+        }
+
         const isPolicyBlocked =
           e.kind === 'policy_blocked' ||
           /prohibited_content|blocked_by_safety|safety_ratings_blocked|prompt block reason/i.test(e.message)
 
         const isTransientInfra =
-          isPolicyBlocked ||
-          e.kind === 'overloaded' ||
-          e.kind === 'model_unavailable' ||
-          e.kind === 'rate' ||
-          e.kind === 'rpd' ||
-          e.kind === 'unavailable' ||
-          e.kind === 'invalid_key' ||
-          e.kind === 'empty' ||
-          e.kind === 'timeout' ||
-          /empty model response|empty response|no text returned|blockreason|safety|file upload|processing timed out|socket|econnreset|etimedout|500|502|503|504|overload|timed out|timeout/i.test(e.message)
+          !isFileProcessingError &&
+          (isPolicyBlocked ||
+            e.kind === 'overloaded' ||
+            e.kind === 'model_unavailable' ||
+            e.kind === 'rate' ||
+            e.kind === 'rpd' ||
+            e.kind === 'unavailable' ||
+            e.kind === 'invalid_key' ||
+            e.kind === 'empty' ||
+            e.kind === 'timeout' ||
+            /empty model response|empty response|no text returned|blockreason|safety|file upload|processing timed out|socket|econnreset|etimedout|500|502|503|504|overload|timed out|timeout/i.test(e.message))
 
-        if (!isTransientInfra) {
+        if (!isTransientInfra && !isFileProcessingError) {
           chunk.attempts = (chunk.attempts || 0) + 1
         }
 
@@ -3588,6 +3607,14 @@ class Scheduler {
           }
           chunk.status = 'pending'
           job.queue.push(chunkIndex)
+        } else if (isFileProcessingError) {
+          chunk.status = 'pending'
+          job.queue.push(chunkIndex)
+          addLog(
+            scan,
+            'warn',
+            `${minutePrefix}Chunk ${chunkIndex}: Video upload processing timed out on Google Files API (${displayModelName(m.id)}, key ${lane.idx}) — corrupt chunk file deleted; re-queued for fresh re-cut on next worker.`,
+          )
         } else if (isTimeoutErr) {
           chunk.status = 'pending'
           job.queue.push(chunkIndex)

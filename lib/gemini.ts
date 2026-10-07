@@ -489,15 +489,23 @@ async function uploadResumableWithProgress(
     throw new Error('Gemini did not return uploaded file name')
   }
 
-  // 3. Poll for ACTIVE state with a 20-minute deadline and resilient error handling
+  // 3. Poll for ACTIVE state with dynamic deadline (90s for chunks/clips <100MB, up to 10m for whole movies >500MB)
   let f = await ai.files.get({ name: uploadedFileName })
-  const deadline = Date.now() + 20 * 60_000
+  const processingTimeoutMs =
+    fileSize > 500 * 1024 * 1024
+      ? 10 * 60_000
+      : fileSize > 100 * 1024 * 1024
+        ? 5 * 60_000
+        : 90_000 // 90 seconds max for 1-minute video chunks / clips
+  const deadline = Date.now() + processingTimeoutMs
   const processingStart = Date.now()
+  let consecutiveErrors = 0
 
   while (f.state === 'PROCESSING') {
     if (safeStopping && safeStopping()) throw new Error('Upload cancelled')
     if (Date.now() > deadline) {
-      throw new GeminiError('other', 'File processing timed out (20 min exceeded)')
+      const limitSec = Math.round(processingTimeoutMs / 1000)
+      throw new GeminiError('other', `File processing timed out (${limitSec}s exceeded)`)
     }
     const elapsedSec = Math.round((Date.now() - processingStart) / 1000)
     safeProgress?.({
@@ -511,8 +519,12 @@ async function uploadResumableWithProgress(
     await new Promise((r) => setTimeout(r, 2500))
     try {
       f = await ai.files.get({ name: f.name! })
-    } catch {
-      // transient network blip, continue polling
+      consecutiveErrors = 0
+    } catch (pollErr) {
+      consecutiveErrors++
+      if (consecutiveErrors >= 6) {
+        throw new GeminiError('other', `Failed to poll Gemini file state (${consecutiveErrors} consecutive errors): ${pollErr instanceof Error ? pollErr.message : String(pollErr)}`)
+      }
     }
   }
 
@@ -549,6 +561,10 @@ export async function uploadVideo(
     try {
       return await uploadResumableWithProgress(apiKey, filePath, ai, safeProgress, safeStopping)
     } catch (err) {
+      const isTimeoutOrCancel = err instanceof Error && /processing timed out|timeout|cancelled|stopped/i.test(err.message)
+      if (isTimeoutOrCancel) {
+        throw err
+      }
       console.warn('Resumable upload failed, falling back to ai.files.upload:', err)
     }
   }
@@ -579,12 +595,24 @@ export async function uploadVideo(
   if (!file) throw lastErr || new GeminiError('other', 'Upload failed without response')
 
   let f = file
-  const deadline = Date.now() + 20 * 60_000
+  const stat = await fs.promises.stat(filePath).catch(() => ({ size: 0 }))
+  const fileSize = stat.size
+  const processingTimeoutMs =
+    fileSize > 500 * 1024 * 1024
+      ? 10 * 60_000
+      : fileSize > 100 * 1024 * 1024
+        ? 5 * 60_000
+        : 90_000
+  const deadline = Date.now() + processingTimeoutMs
   const processingStart = Date.now()
-  // FAST POLLING with 20m deadline: check every 2.5s until ACTIVE
+  let consecutiveErrors = 0
+  // FAST POLLING with dynamic deadline: check every 2.5s until ACTIVE
   while (f.state === 'PROCESSING') {
     if (safeStopping && safeStopping()) throw new Error('Stopped')
-    if (Date.now() > deadline) throw new GeminiError('other', 'File processing timed out (20 min exceeded)')
+    if (Date.now() > deadline) {
+      const limitSec = Math.round(processingTimeoutMs / 1000)
+      throw new GeminiError('other', `File processing timed out (${limitSec}s exceeded)`)
+    }
     const elapsedSec = Math.round((Date.now() - processingStart) / 1000)
     safeProgress?.({
       bytesUploaded: 1,
@@ -597,8 +625,12 @@ export async function uploadVideo(
     await new Promise((r) => setTimeout(r, 2500))
     try {
       f = await ai.files.get({ name: f.name! })
-    } catch {
-      // transient network blip
+      consecutiveErrors = 0
+    } catch (pollErr) {
+      consecutiveErrors++
+      if (consecutiveErrors >= 6) {
+        throw new GeminiError('other', `Failed to poll Gemini file state (${consecutiveErrors} consecutive errors): ${pollErr instanceof Error ? pollErr.message : String(pollErr)}`)
+      }
     }
   }
   if (f.state !== 'ACTIVE') {

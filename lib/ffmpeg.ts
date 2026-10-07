@@ -43,7 +43,7 @@ const SCAN_FPS_STR = String(SCAN_FPS)
 /** Input-side flags for precise cutting. Placed before `-i`. */
 const IN_FLAGS = ['-fflags', '+genpts']
 /** Output-side flags shared by every encode. */
-const OUT_FLAGS = ['-avoid_negative_ts', 'make_zero', '-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '1']
+const OUT_FLAGS = ['-avoid_negative_ts', 'make_zero', '-fps_mode', 'cfr', '-pix_fmt', 'yuv420p', '-threads', '1', '-max_muxing_queue_size', '1024']
 /** Final joins obey the same one-thread-per-engine contract as every other
  * pooled process. Their filters already reset both streams to timestamp zero;
  * avoid_negative_ts would shift an H.264 MP4 forward by two frames. */
